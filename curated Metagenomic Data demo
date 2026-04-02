@@ -1,0 +1,155 @@
+# ================================
+# Project: curated Metagenomic Data demo
+# Author: Jingyi Huang
+# ================================
+rm(list = ls())
+set.seed(123)
+
+#renv::status() #检查状态
+#renv::init() #初始化
+renv::restore()
+# -------------------------------
+# 1. Load packages
+# -------------------------------
+library(phyloseq)
+library(curatedMetagenomicData)
+library(vegan)
+library(cluster)
+library(mixOmics)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(ggpubr)
+library(dplyr)
+library(pheatmap)
+
+renv::snapshot()#执行后生成lockfile，记录环境
+# -------------------------------
+# 2. Load stable dataset
+# -------------------------------
+data_list <- curatedMetagenomicData("ZellerG_2014.relative_abundance", dryrun = FALSE)
+eset <- data_list[[1]]
+
+expr <- assay(eset)
+meta <- as.data.frame(colData(eset))
+
+# -------------------------------
+# 3. Build phyloseq
+# -------------------------------
+otu <- otu_table(expr, taxa_are_rows = TRUE)
+sample_data_ps <- sample_data(meta)
+
+taxa_df <- as.data.frame(rowData(eset)[, c("phylum","genus","species")])
+tax <- tax_table(as.matrix(taxa_df))
+
+ps <- phyloseq(otu, sample_data_ps, tax)
+
+# -------------------------------
+# 4. Filtering
+# -------------------------------
+ps_raw <- ps
+ps <- subset_samples(ps, !is.na(age) & !is.na(gender))
+ps <- filter_taxa(ps, function(x) sum(x > 1e-4) > 0.1*length(x), TRUE)
+# relative abundance
+ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+
+# -------------------------------
+# 5. Alpha diversity
+# -------------------------------
+alpha_div <- estimate_richness(ps_raw, measures = c("Shannon","Simpson"))
+meta_df_full <- data.frame(sample_data(ps_raw))
+alpha_df <- cbind(alpha_div, meta_df_full)
+
+# -------------------------------
+# 6. Beta diversity (JSD + PCoA)
+# -------------------------------
+X <- as(otu_table(ps_rel), "matrix")
+X <- t(X)  # sample × taxa
+
+# ensure probability
+X <- X / rowSums(X)
+
+js <- vegdist(X, method = "bray")  # 更稳定（替代JSD）
+
+ordination <- cmdscale(js, k=2)
+
+ord_df <- data.frame(ordination)
+colnames(ord_df) <- c("PC1","PC2")
+
+# -------------------------------
+# 7. Enterotype clustering（修复版）
+# -------------------------------
+# 创建 metadata（关键）
+meta_df <- data.frame(sample_data(ps_rel))
+
+# silhouette 选 k
+sil_width <- sapply(2:5, function(k){
+  pam(js, k)$silinfo$avg.width
+})
+
+best_k <- which.max(sil_width) + 1
+
+pam_res <- pam(js, k = best_k)
+
+# 对齐样本（关键）
+meta_df$Enterotype <- factor(
+  pam_res$clustering[match(rownames(meta_df), names(pam_res$clustering))]
+)
+# -------------------------------
+# 8. PCoA plot
+# -------------------------------
+ord_df$Enterotype <- meta_df$Enterotype
+
+ggplot(ord_df, aes(PC1, PC2, color=Enterotype)) +
+  geom_point(size=3) +
+  theme_minimal()
+
+# -------------------------------
+# 9. PERMANOVA
+# -------------------------------
+meta_df <- data.frame(sample_data(ps_rel))
+meta_df <- meta_df[match(rownames(as.matrix(js)), rownames(meta_df)), ]
+adonis_res <- adonis2(js ~ age + gender, data = meta_df)
+
+# -------------------------------
+# 10. sPLS
+# -------------------------------
+X_pls <- scale(X)
+Y <- meta_df[, c("age")]
+Y <- scale(Y)
+
+spls_res <- spls(X_pls, Y, ncomp=2, keepX=c(20,20))
+
+vip_scores <- vip(spls_res)
+
+vip_df <- data.frame(
+  Taxa = rownames(vip_scores),
+  VIP = vip_scores[,1]
+)
+
+top_taxa <- vip_df %>%
+  dplyr::arrange(dplyr::desc(VIP)) %>%
+  head(15)
+
+ggplot(top_taxa, aes(reorder(Taxa, VIP), VIP)) +
+  geom_bar(stat="identity") +
+  coord_flip() +
+  theme_minimal()
+
+# -------------------------------
+# 11. Heatmap
+# -------------------------------
+top20 <- names(sort(taxa_sums(ps_rel), TRUE))[1:20]
+ps_top <- prune_taxa(top20, ps_rel)
+
+mat <- as.matrix(otu_table(ps_top))
+pheatmap(log1p(mat))
+
+# -------------------------------
+# 12. Save results
+# -------------------------------
+setwd("D:/JANE/CAAS/demo/curatedMetagenomicData/results/tables")
+write.csv(alpha_df, "alpha_div.csv")
+write.csv(vip_df, "vip_scores.csv")
+write.csv(meta_df, "metadata.csv")
+write.csv(as.data.frame(adonis_res), "permanova.csv")
