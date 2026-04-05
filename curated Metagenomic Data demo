@@ -1,13 +1,16 @@
-# ================================
 # Project: curated Metagenomic Data demo
 # Author: Jingyi Huang
-# ================================
+
 rm(list = ls())
 set.seed(123)
 
+# -------------------------------
+# 0. 环境管理
+# -------------------------------
 #renv::status() #检查状态
 #renv::init() #初始化
-renv::restore()
+# renv::restore()  # 确保环境一致
+
 # -------------------------------
 # 1. Load packages
 # -------------------------------
@@ -16,20 +19,24 @@ library(curatedMetagenomicData)
 library(vegan)
 library(cluster)
 library(mixOmics)
+library(randomForest)
+library(iml)       # SHAP解释
 library(dplyr)
+library(pheatmap)
 library(ggplot2)
-library(pheatmap)
 library(ggpubr)
-library(dplyr)
-library(pheatmap)
+library(ggforce)
+library(RColorBrewer)
+library(tidyr)
+library(pROC)
 
 renv::snapshot()#执行后生成lockfile，记录环境
+
 # -------------------------------
 # 2. Load stable dataset
 # -------------------------------
 data_list <- curatedMetagenomicData("ZellerG_2014.relative_abundance", dryrun = FALSE)
 eset <- data_list[[1]]
-
 expr <- assay(eset)
 meta <- as.data.frame(colData(eset))
 
@@ -38,118 +45,343 @@ meta <- as.data.frame(colData(eset))
 # -------------------------------
 otu <- otu_table(expr, taxa_are_rows = TRUE)
 sample_data_ps <- sample_data(meta)
-
 taxa_df <- as.data.frame(rowData(eset)[, c("phylum","genus","species")])
 tax <- tax_table(as.matrix(taxa_df))
-
 ps <- phyloseq(otu, sample_data_ps, tax)
 
 # -------------------------------
 # 4. Filtering
 # -------------------------------
-ps_raw <- ps
 ps <- subset_samples(ps, !is.na(age) & !is.na(gender))
 ps <- filter_taxa(ps, function(x) sum(x > 1e-4) > 0.1*length(x), TRUE)
-# relative abundance
 ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+meta_df <- data.frame(sample_data(ps_rel))
 
 # -------------------------------
 # 5. Alpha diversity
 # -------------------------------
-alpha_div <- estimate_richness(ps_raw, measures = c("Shannon","Simpson"))
-meta_df_full <- data.frame(sample_data(ps_raw))
-alpha_df <- cbind(alpha_div, meta_df_full)
+alpha_div <- estimate_richness(ps_rel, measures=c("Shannon","Simpson"))
+alpha_df <- cbind(alpha_div, meta_df)
+
+# 自动生成颜色
+disease_levels <- unique(alpha_df$disease)
+my_colors <- setNames(brewer.pal(n=max(3,length(disease_levels)), name="Set2")[1:length(disease_levels)],
+                      disease_levels)
+
+# 绘制 Alpha 多样性（Shannon & Simpson）
+alpha_long <- alpha_df %>%
+  select(Shannon, Simpson, disease) %>%
+  pivot_longer(cols=c(Shannon, Simpson), names_to="Index", values_to="Value")
+
+ggplot(alpha_long, aes(x=disease, y=Value, fill=disease)) +
+  geom_boxplot(alpha=0.7) +
+  geom_jitter(aes(color=disease), width=0.2, alpha=0.5, size=2) +
+  scale_fill_manual(values=my_colors) +
+  scale_color_manual(values=my_colors) +
+  facet_wrap(~Index, scales="free_y") +
+  theme_minimal(base_size = 14) +
+  labs(title="Alpha Diversity - Shannon & Simpson", x="Disease Status", y="Diversity Value") +
+  theme(legend.position="bottom")
 
 # -------------------------------
-# 6. Beta diversity (JSD + PCoA)
+# 6. Beta diversity (Bray-Curtis + PCoA)
 # -------------------------------
-X <- as(otu_table(ps_rel), "matrix")
-X <- t(X)  # sample × taxa
-
-# ensure probability
+X <- t(as(otu_table(ps_rel), "matrix"))
 X <- X / rowSums(X)
-
-js <- vegdist(X, method = "bray")  # 更稳定（替代JSD）
-
-ordination <- cmdscale(js, k=2)
-
+dist_bc <- vegdist(X, method="bray")
+ordination <- cmdscale(dist_bc, k=2)
 ord_df <- data.frame(ordination)
 colnames(ord_df) <- c("PC1","PC2")
+ord_df$Disease <- meta_df$disease
+
+ggplot(ord_df, aes(PC1, PC2, color=Disease)) +
+  geom_point(size=3, alpha=0.8) +
+  stat_ellipse(aes(color=Disease), level=0.95, linetype=2, linewidth=1) +
+  scale_color_manual(values=my_colors) +
+  theme_minimal(base_size = 14) +
+  labs(title="PCoA - Bray-Curtis", x="PC1", y="PC2") +
+  theme(legend.position="bottom")
 
 # -------------------------------
-# 7. Enterotype clustering（修复版）
+# 7. Enterotype-like clustering (PAM)
 # -------------------------------
-# 创建 metadata（关键）
-meta_df <- data.frame(sample_data(ps_rel))
-
-# silhouette 选 k
-sil_width <- sapply(2:5, function(k){
-  pam(js, k)$silinfo$avg.width
-})
-
+sil_width <- sapply(2:5, function(k) pam(dist_bc, k)$silinfo$avg.width)
 best_k <- which.max(sil_width) + 1
-
-pam_res <- pam(js, k = best_k)
-
-# 对齐样本（关键）
-meta_df$Enterotype <- factor(
-  pam_res$clustering[match(rownames(meta_df), names(pam_res$clustering))]
-)
-# -------------------------------
-# 8. PCoA plot
-# -------------------------------
+pam_res <- pam(dist_bc, k=best_k)
+meta_df$Enterotype <- factor(pam_res$clustering[match(rownames(meta_df), names(pam_res$clustering))])
+#meta_df$Enterotype <- factor(pam(dist_bc, k=3)$clustering)  # k=3默认，可用silhouette选
 ord_df$Enterotype <- meta_df$Enterotype
 
-ggplot(ord_df, aes(PC1, PC2, color=Enterotype)) +
+# Enterotype 颜色
+enterotype_levels <- levels(ord_df$Enterotype)
+my_enterotype_colors <- setNames(brewer.pal(n=max(3,length(enterotype_levels)), name="Set2")[1:length(enterotype_levels)],
+                                 enterotype_levels)
+
+# 1) Ellipse
+p_enter1 <- ggplot(ord_df, aes(PC1, PC2, color=Enterotype)) +
   geom_point(size=3) +
-  theme_minimal()
+  geom_mark_ellipse(aes(fill=Enterotype), alpha=0.15, color=NA) +
+  scale_color_manual(values=my_enterotype_colors) +
+  scale_fill_manual(values=my_enterotype_colors) +
+  theme_minimal(base_size=14) +
+  labs(title="Enterotype-like Clusters (Ellipse)")
+p_enter1
+
+# 2) Convex hull
+hull_df <- ord_df %>% group_by(Enterotype) %>% slice(chull(PC1, PC2))
+p_enter2 <- ggplot(ord_df, aes(PC1, PC2, color=Enterotype)) +
+  geom_point(size=3) +
+  geom_polygon(data=hull_df, aes(fill=Enterotype), alpha=0.2, color=NA) +
+  scale_color_manual(values=my_enterotype_colors) +
+  scale_fill_manual(values=my_enterotype_colors) +
+  theme_minimal(base_size=14) +
+  labs(title="Enterotype-like Clusters (Convex Hull)")
+p_enter2
 
 # -------------------------------
 # 9. PERMANOVA
 # -------------------------------
-meta_df <- data.frame(sample_data(ps_rel))
-meta_df <- meta_df[match(rownames(as.matrix(js)), rownames(meta_df)), ]
-adonis_res <- adonis2(js ~ age + gender, data = meta_df)
+adonis_res <- adonis2(dist_bc ~ age + gender, data=meta_df)
+print(adonis_res)
 
 # -------------------------------
-# 10. sPLS
+# 10. Top20 taxa Heatmap
 # -------------------------------
-X_pls <- scale(X)
-Y <- meta_df[, c("age")]
-Y <- scale(Y)
+top20 <- names(sort(taxa_sums(ps_rel), decreasing=TRUE))[1:20]
+ps_top <- prune_taxa(top20, ps_rel)
+mat_top <- as.matrix(otu_table(ps_top))
+rownames(mat_top) <- sapply(rownames(mat_top), function(x){
+  sp <- strsplit(x,"\\|")[[1]]; s <- sp[grep("^s__",sp)]; if(length(s)==0) s <- tail(sp,1); sub("^s__","",s)
+})
 
-spls_res <- spls(X_pls, Y, ncomp=2, keepX=c(20,20))
-
-vip_scores <- vip(spls_res)
-
-vip_df <- data.frame(
-  Taxa = rownames(vip_scores),
-  VIP = vip_scores[,1]
+annotation <- data.frame(Enterotype=meta_df$Enterotype, Cluster=factor(cutree(hclust(dist(t(log1p(mat_top)))),k=3)))
+annotation_colors <- list(
+  Enterotype = my_enterotype_colors,
+  Cluster = setNames(c("#e41a1c","#377eb8","#4daf4a")[1:length(levels(annotation$Cluster))], levels(annotation$Cluster))
 )
 
-top_taxa <- vip_df %>%
-  dplyr::arrange(dplyr::desc(VIP)) %>%
+pheatmap(
+  mat=log1p(mat_top),
+  annotation_col=annotation,
+  annotation_colors=annotation_colors,
+  show_colnames=FALSE,
+  show_rownames=TRUE,
+  fontsize_row=8,
+  fontsize_col=0,
+  main="Top20 taxa by Enterotype",
+  border_color=NA,
+  cluster_rows=hclust(dist(log1p(mat_top))),
+  cluster_cols=hclust(dist(t(log1p(mat_top)))),
+  color=colorRampPalette(c("#4575b4","#ffffbf","#d73027"))(100)
+)
+
+# -------------------------------
+# 11. sPLS-DA with short Taxa names
+# -------------------------------
+# 数据标准化
+X_pls <- scale(X)
+Y <- factor(meta_df$disease == "CRC", labels = c("NoCRC","CRC"))
+# 设置 keepX 的候选值（可根据需要调整）
+keepX_set <- seq(5, 30, 5)
+set.seed(123)
+# 初始拟合 sPLS-DA，先选 ncomp=3（最大尝试）
+splsda_init <- splsda(X_pls, Y, ncomp = 3, keepX = rep(max(keepX_set), 3))
+# 交叉验证性能评估
+perf_res <- perf(splsda_init,validation = "Mfold",folds = 5,
+  nrepeat = 10,progressBar = TRUE,dist = "centroids.dist")
+# 自动选择最佳 ncomp（BER 最低）
+ber_means <- colMeans(perf_res$error.rate$BER)
+best_ncomp <- which.min(ber_means)
+cat("Selected best ncomp =", best_ncomp, "\n")
+# 设置最佳 keepX（可手动调整，每个组件对应的特征数）
+best_keepX <- rep(20, best_ncomp)
+# 使用最佳参数重新拟合 sPLS-DA
+splsda_res <- splsda(X_pls, Y, ncomp = best_ncomp, keepX = best_keepX)
+# 提取 VIP 分数
+vip_scores <- vip(splsda_res)
+vip_df <- data.frame(Taxa = rownames(vip_scores), VIP = vip_scores[,1])
+# 假设原始名字是界门纲目科属种，用 "|" 或 ";" 分割
+vip_df$ShortTaxa <- sapply(vip_df$Taxa, function(x){
+  parts <- strsplit(x, "\\|")[[1]]
+  species <- parts[grep("^s__", parts)]
+  if(length(species) == 0) species <- tail(parts,1)
+  sub("^s__", "", species)
+})
+# Top 15 VIP
+top_vip <- vip_df %>% arrange(desc(VIP)) %>% head(15)
+vip_palette <- brewer.pal(3, "Set2")[1]  # 单色条，也可以自定义
+p_vip <- ggplot(top_vip, aes(x = reorder(ShortTaxa, VIP), y = VIP)) +
+  geom_bar(stat = "identity", fill = vip_palette) +
+  coord_flip() +
+  theme_minimal(base_size = 14) +
+  labs(title = "Top sPLS-DA VIP Scores", x = "Taxa (short name)", y = "VIP Score") +
+  theme(legend.position = "none")  # 无图例
+p_vip
+
+# -------------------------------
+# 12. Random Forest + SHAP (FINAL FIXED VERSION)
+# ------------------------------
+# 特征矩阵（样本 × taxa）
+X_rf <- X  
+# 短命名（统一风格：species）
+colnames(X_rf) <- sapply(colnames(X_rf), function(x){
+  parts <- strsplit(x, "\\|")[[1]]
+  species <- parts[grep("^s__", parts)]
+  if(length(species) == 0) species <- tail(parts,1)
+  sub("^s__", "", species)
+})
+
+# 响应变量
+Y_rf <- meta_df$disease
+# 合并后去 NA（最关键一步）
+rf_df <- data.frame(Y = Y_rf, X_rf)
+rf_df <- rf_df[complete.cases(rf_df), ]
+# 拆分回 X 和 Y
+Y_rf <- factor(rf_df$Y)
+X_rf <- rf_df[, -1]
+
+# Train/Test split（避免过拟合）
+set.seed(123)
+train_idx <- sample(1:nrow(X_rf), 0.7*nrow(X_rf))
+X_train <- X_rf[train_idx, ]
+Y_train <- Y_rf[train_idx]
+
+X_test <- X_rf[-train_idx, ]
+Y_test <- Y_rf[-train_idx]
+
+# 重新训练模型
+rf_model <- randomForest(x=X_train, y=Y_train, ntree=1000, importance=TRUE)
+print(rf_model)
+
+# 特征重要性（统一风格）
+imp <- importance(rf_model)
+imp_df <- data.frame(Taxa = rownames(imp),MeanDecreaseGini = imp[, "MeanDecreaseGini"])
+
+# Top 15
+top_rf <- imp_df %>%
+  arrange(desc(MeanDecreaseGini)) %>%
   head(15)
 
-ggplot(top_taxa, aes(reorder(Taxa, VIP), VIP)) +
-  geom_bar(stat="identity") +
+# 统一颜色（与 sPLS-DA 区分）
+rf_color <- brewer.pal(3, "Set2")[2]
+ggplot(top_rf, aes(x = reorder(Taxa, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat="identity", fill=rf_color) +
   coord_flip() +
-  theme_minimal()
+  theme_minimal(base_size=14) +
+  labs(title="Random Forest Top Features", x="Taxa (species)", y="MeanDecreaseGini") +
+  theme(legend.position="none")
+
+# SHAP（全样本平均贡献，而不是单样本）
+# iml Predictor（必须用 data.frame）；用测试集做 SHAP
+predictor <- Predictor$new(model = rf_model,data = X_test,y = Y_test,type = "prob")
+# 只对 Top taxa 做 SHAP（否则非常慢）
+top_features <- top_rf$Taxa
+
+# 计算 SHAP（FeatureImp + Shapley approximation）
+set.seed(123)
+shap_imp <- FeatureImp$new(predictor,loss = "ce")   # classification error
+
+# 取 Top 15 SHAP
+shap_df <- shap_imp$results %>%
+  filter(feature %in% top_features) %>%
+  arrange(desc(importance)) %>%
+  head(15)
+
+# SHAP 可视化（统一风格）
+shap_color <- brewer.pal(3, "Set2")[3]
+ggplot(shap_df, aes(x = reorder(feature, importance), y = importance)) +
+  geom_bar(stat="identity", fill=shap_color) +
+  coord_flip() +
+  theme_minimal(base_size=14) +
+  labs(title="SHAP Feature Importance (Global)", x="Taxa (species)", y="Importance") +
+  theme(legend.position="none")
 
 # -------------------------------
-# 11. Heatmap
+# 13. ROC + AUC + Confusion Matrix
 # -------------------------------
-top20 <- names(sort(taxa_sums(ps_rel), TRUE))[1:20]
-ps_top <- prune_taxa(top20, ps_rel)
+#RF性能评估（ROC/AUC）
+# 预测概率
+pred_prob <- predict(rf_model, X_test, type="prob")[, "CRC"]
 
-mat <- as.matrix(otu_table(ps_top))
-pheatmap(log1p(mat))
+# ROC
+roc_obj <- roc(Y_test, pred_prob)
+
+# 绘图（统一风格）
+ggplot() +
+  geom_line(aes(x=1-roc_obj$specificities, y=roc_obj$sensitivities),
+            color="#1f77b4", linewidth=1.2) +
+  geom_abline(linetype="dashed") +
+  theme_minimal(base_size=14) +
+  labs(title=paste0("ROC Curve (AUC = ", round(auc(roc_obj),3), ")"),
+       x="False Positive Rate",
+       y="True Positive Rate")
 
 # -------------------------------
-# 12. Save results
+# Confusion Matrix
 # -------------------------------
-setwd("D:/JANE/CAAS/demo/curatedMetagenomicData/results/tables")
+pred_class <- predict(rf_model, X_test)
+table(Predicted=pred_class, Actual=Y_test)
+
+# -------------------------------
+# 14. Core taxa (sPLS-DA ∩ RF ∩ SHAP)
+# -------------------------------
+core_taxa <- Reduce(intersect, list(
+  top_vip$Taxa,
+  top_rf$Taxa,
+  shap_df$feature
+))
+
+core_taxa
+length(core_taxa)
+
+# -------------------------------
+# 15. Core taxa (sPLS-DA ∩ RF ∩ SHAP)
+# -------------------------------
+core_taxa <- Reduce(intersect, list(
+  top_vip$Taxa,
+  top_rf$Taxa,
+  shap_df$feature
+))
+
+core_taxa
+length(core_taxa)
+
+# -------------------------------
+# 16. Core taxa Heatmap
+# -------------------------------
+if(length(core_taxa) > 2){
+  
+  ps_core <- prune_taxa(core_taxa, ps_rel)
+  mat_core <- as.matrix(otu_table(ps_core))
+  
+  # 行名短化
+  rownames(mat_core) <- core_taxa
+  
+  annotation_core <- data.frame(Disease=meta_df$disease)
+  rownames(annotation_core) <- rownames(meta_df)
+  
+  ann_colors <- list(Disease = my_colors)
+  
+  pheatmap(
+    log1p(mat_core),
+    annotation_col = annotation_core,
+    annotation_colors = ann_colors,
+    show_colnames = FALSE,
+    fontsize_row = 10,
+    main = "Core Taxa Heatmap",
+    color = colorRampPalette(c("#4575b4","#ffffbf","#d73027"))(100)
+  )
+}
+
+# -------------------------------
+# 17. Save results
+# -------------------------------
+setwd("")
+dir.create("results", showWarnings = FALSE)
 write.csv(alpha_df, "alpha_div.csv")
 write.csv(vip_df, "vip_scores.csv")
 write.csv(meta_df, "metadata.csv")
 write.csv(as.data.frame(adonis_res), "permanova.csv")
+write.csv(top_rf, "rf_importance.csv")
+
+
